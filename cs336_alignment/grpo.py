@@ -1,7 +1,7 @@
 import torch
 import os
 from typing import Any, Callable, Literal
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizer, PreTrainedModel
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 from einops import rearrange
 
 def get_model_and_tokenizer(model_id_or_dir: str, device: str):
@@ -335,45 +335,72 @@ def compute_policy_gradient_loss(
                 Statistics from the underlying loss call, such as
                 clip-fraction components.
     """
+    if policy_log_probs.ndim != 2:
+        raise ValueError("policy_log_probs must have shape (batch_size, sequence_length)")
+    batch_size = policy_log_probs.shape[0]
+    if raw_rewards_or_advantages.shape not in ((batch_size,), (batch_size, 1)):
+        raise ValueError("rewards or advantages must have shape (batch_size,) or (batch_size, 1)")
+    if importance_reweighting_method not in ("none", "noclip", "grpo", "gspo"):
+        raise ValueError("unknown importance_reweighting_method")
     if old_log_probs is not None and old_log_probs.shape != policy_log_probs.shape:
-        raise ValueError("the shape of old_log_probs and policy_log_probs must equal to (batch_size, sequence_length)")  
-        
-    raw_rewards_or_advantages = raw_rewards_or_advantages.reshape(-1, 1)
-        
-    with torch.no_grad():
-        if importance_reweighting_method == "gspo":
-            if old_log_probs is None:
-                raise ValueError("gspo algorithm needs old log probs")  
-            omega = torch.exp(policy_log_probs - old_log_probs) 
-            if cliprange is not None:
-                omega.clip_(1 - cliprange, 1 + cliprange)
-            if response_mask is not None:
-                omega = omega * response_mask / response_mask.mean(dim=-1, keepdim=True)
-        elif importance_reweighting_method == "grpo":
-            if old_log_probs is None:
-                raise ValueError("gspo algorithm needs old log probs") 
-            omega = torch.exp(policy_log_probs - old_log_probs)
-            if cliprange is not None:
-                omega.clip_(1 - cliprange, 1 + cliprange) 
-            if response_mask is not None:
-                omega = omega * response_mask
-        elif importance_reweighting_method == "noclip":
-            if old_log_probs is None:
-                omega = torch.ones_like(policy_log_probs)  
-            else:
-                omega = torch.exp(policy_log_probs - old_log_probs)
-            if response_mask is not None:
-                omega = omega * response_mask
-        elif importance_reweighting_method == "none":
-            omega = torch.ones_like(policy_log_probs)
-            if response_mask is not None:
-                omega = omega * response_mask
-        
-    per_token_policy_gradient_loss = omega * policy_log_probs * raw_rewards_or_advantages
+        raise ValueError("old_log_probs and policy_log_probs must have the same shape")
+    if response_mask is not None and response_mask.shape != policy_log_probs.shape:
+        raise ValueError("response_mask and policy_log_probs must have the same shape")
+    if importance_reweighting_method != "none":
+        if old_log_probs is None:
+            raise ValueError("importance reweighting requires old_log_probs")
+        if importance_reweighting_method in ("grpo", "gspo"):
+            if cliprange is None or cliprange < 0:
+                raise ValueError("clipped methods require a non-negative cliprange")
 
+
+    advantages = raw_rewards_or_advantages.detach().reshape(batch_size, 1)
     metadata = {}
+    if importance_reweighting_method == "none":
+        # no importance reweighting
+        return -advantages * policy_log_probs, metadata
+
+    elif importance_reweighting_method == "noclip":
+        # apply importance reweighting without clipping
+        # importance reweighting below
+        log_ratio = policy_log_probs - old_log_probs.detach()
+        ratio = log_ratio.exp()
+        return -advantages * ratio, metadata
     
-    return (per_token_policy_gradient_loss, metadata)
+    elif importance_reweighting_method == "grpo":
+        # do PPO/GRPO-style token-level reweighting and clipping
+        # importance reweighting below
+        log_ratio = policy_log_probs - old_log_probs.detach()
+        ratio = log_ratio.exp()
+        # clipping
+        objective = ratio * advantages
+        clipped_objective = ratio.clamp(1 - cliprange, 1 + cliprange) * advantages
+        metadata["clip_fraction"] = (clipped_objective < objective).to(ratio.dtype).detach().mean()
+        objective = torch.minimum(objective, clipped_objective)
+        per_token_policy_gradient_loss = -objective
+        return per_token_policy_gradient_loss, metadata
+
+    elif importance_reweighting_method == "gspo":
+        # do GSPO-style sequence-level reweighting and clipping.
+        # GSPO-style sequence-level reweighting below
+        log_ratio = policy_log_probs - old_log_probs.detach()
+        if response_mask is None:
+            raise ValueError("GSPO requires response_mask to identify response tokens")
+        mask = response_mask.to(device=log_ratio.device, dtype=log_ratio.dtype)
+        response_lengths = mask.sum(dim=-1, keepdim=True)
+        if (response_lengths <= 0).any():
+            raise ValueError("each GSPO response must contain at least one unmasked token")       
+        # log_ratio_gspo = (pi_theta(y_1) + pi_theta(y_2) + ... - pi_0(y_1) - pi_0(y_2) - ...) / len(y)
+        log_ratio_gspo = log_ratio.masked_fill(mask == 0, 0).sum(dim=-1, keepdim=True) / response_lengths
+        ratio_gspo = log_ratio_gspo.exp()
+        # clipping
+        objective = ratio_gspo * advantages
+        clipped_objective = ratio_gspo.clamp(1 - cliprange, 1 + cliprange) * advantages
+        metadata["clip_fraction"] = (clipped_objective < objective).to(ratio_gspo.dtype).detach().mean()
+        objective = torch.minimum(objective, clipped_objective)
+        per_token_policy_gradient_loss = -objective.expand_as(policy_log_probs)
+        return per_token_policy_gradient_loss, metadata
+
 
 
 def aggregate_loss_across_microbatch(
@@ -405,10 +432,20 @@ def aggregate_loss_across_microbatch(
             A scalar containing the average loss. Make sure you can later call
             backward on this loss.
     """
-    raise NotImplementedError
-
-
-
+    if (mask.sum(dim=-1) == 0).any():
+        raise ValueError("each sequence must contain at least one unmasked response token")
+    per_token_policy_gradient_loss = mask * per_token_policy_gradient_loss
+    batch_size = per_token_policy_gradient_loss.shape[0] 
+    if loss_normalization == "sequence":
+        per_token_policy_gradient_loss = per_token_policy_gradient_loss / mask.sum(dim=-1, keepdim=True)
+        per_token_policy_gradient_loss.mul_(1 / batch_size)
+    elif loss_normalization == "constant":
+        if normalization_constant is None:
+            raise ValueError("constant normalization needs normalization_constant")
+        if normalization_constant <= 0:
+            raise ValueError("normalization_constant should bigger than 0")
+        per_token_policy_gradient_loss.mul_(1 / normalization_constant)
+    return per_token_policy_gradient_loss.sum()
 
 
 
@@ -499,4 +536,90 @@ def grpo_train_step(
                 Dict with metadata from the underlying loss call, gradient norm
                 before clipping, and any other statistics you might want to log.
     """
-    raise NotImplementedError
+    batch_size = len(rollout_responses)
+    
+    if not 1 <= gradient_accumulation_steps <= batch_size:
+        raise ValueError("gradient_accumulation_steps must be between 1 and batch_size")
+
+  
+    tokenized_batch = tokenize_prompt_and_output(
+        repeated_prompts, rollout_responses, tokenizer
+    )
+    device = next(model.parameters()).device
+    # 保持全批次的 padding 宽度一致，每次只将一个 microbatch 移到模型设备。
+    input_ids = tokenized_batch["input_ids"]
+    labels = tokenized_batch["labels"]
+    response_mask = tokenized_batch["response_mask"]
+    if old_log_probs is not None:
+        old_log_probs = old_log_probs.detach()
+
+    raw_rewards, metadata1 = compute_rollout_rewards(reward_fn,
+                                                    rollout_responses,
+                                                    repeated_ground_truths
+                                                    )
+
+    rewards, metadata2 = compute_group_normalized_rewards(raw_rewards,
+                                                         group_size,
+                                                         baseline,
+                                                         advantage_eps,
+                                                         advantage_normalizer,
+                                                         )
+    metadata = {**metadata1, **metadata2}
+    loss = torch.zeros((), device=device)
+    entropy_sum = torch.zeros((), device=device)
+    token_count = 0
+    optimizer.zero_grad(set_to_none=True)
+
+
+    for microbatch_index in range(gradient_accumulation_steps):
+        # 用整数边界拆出恰好指定数量的非空 microbatch，也支持不等大的尾批。
+        start = microbatch_index * batch_size // gradient_accumulation_steps
+        end = (microbatch_index + 1) * batch_size // gradient_accumulation_steps
+        micro_mask = response_mask[start:end].to(device)
+        response_scores = get_response_log_probs(
+            model,
+            input_ids[start:end].to(device),
+            labels[start:end].to(device),
+            return_token_entropy=True,
+        )
+        per_token_loss, micro_metadata = compute_policy_gradient_loss(
+            rewards[start:end].to(device),
+            response_scores["log_probs"],
+            importance_reweighting_method,
+            old_log_probs[start:end].to(device) if old_log_probs is not None else None,
+            cliprange,
+            micro_mask,
+        )
+        micro_loss = aggregate_loss_across_microbatch(
+            per_token_loss, micro_mask, loss_normalization, normalization_constant
+        )
+        microbatch_weight = (end - start) / batch_size
+        if loss_normalization == "sequence":
+            # 聚合函数返回小批的序列均值，按样本占比还原为全批均值。
+            micro_loss = micro_loss * microbatch_weight
+        # constant 返回小批损失总和 / 同一个常数，直接相加，不再除累积步数
+        # 如果不每个micro_loss反向传播，而是直接不detach累加到loss里面，那么将失去accumulation的意义
+        # 中间的激活态和计算图将会越来越多
+        micro_loss.backward()
+        loss = loss + micro_loss.detach()
+
+        entropy_sum = entropy_sum + response_scores["token_entropy"].detach().masked_select(
+            micro_mask.bool()
+        ).sum()
+        token_count += int(micro_mask.sum().item())
+        for key, value in micro_metadata.items():
+            metadata[key] = metadata.get(key, 0.0) + value.detach() * microbatch_weight
+
+        # 不保留已完成 microbatch 的输出或计算图。
+        del response_scores, per_token_loss, micro_loss
+
+
+    metadata["token_entropy"] = entropy_sum / token_count
+    grad_norm = torch.nn.utils.clip_grad_norm_(
+        model.parameters(), max_grad_norm if max_grad_norm is not None else float("inf")
+    )
+    metadata["grad_norm"] = grad_norm.detach()
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+
+    return loss, metadata
