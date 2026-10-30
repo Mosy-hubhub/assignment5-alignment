@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from cs336_alignment.utils import DEFAULT_MODEL, REPO_ROOT, generate_batch, load_generation_model
+from cs336_alignment.utils import DEFAULT_MODEL, REPO_ROOT, generate_batch, load_generation_model, load_eval_template
 
 
 def load_alpaca(data_path: str | Path) -> list[dict[str, str]]:
@@ -22,44 +22,47 @@ def load_alpaca(data_path: str | Path) -> list[dict[str, str]]:
     return examples
 
 
-def build_alpaca_prompts(examples: list[dict[str, str]]) -> list[str]:
+def build_alpaca_prompts(examples: list[dict[str, str]], prompt_mode: str = "base") -> list[str]:
     prompt_dir = REPO_ROOT / "cs336_alignment/prompts_safety"
     task_template = (prompt_dir / "alpaca_eval_zero_shot.prompt").read_text(encoding="utf-8")
-    system_template = (prompt_dir / "zero_shot_system_prompt.prompt").read_text(encoding="utf-8")
+    system_template = load_eval_template(prompt_mode)
     return [
-        system_template.format(instruction=task_template.format(instruction=example["instruction"]))
+        system_template.format(instruction=task_template.format(instruction=example["instruction"]), response="")
         for example in examples
     ]
 
 
 def evaluate(
+    output_dir: str | Path,
     model_name_or_path: str = DEFAULT_MODEL,
     data_path: str | Path = REPO_ROOT / "data/alpaca_eval/alpaca_eval_gpt4_turbo.json",
-    output_dir: str | Path = REPO_ROOT / "results/alpaca_baseline",
     batch_size: int = 1,
     max_new_tokens: int = 1024,
     device: str = "cuda:0",
     limit: int | None = None,
     seed: int = 0,
     dry_run: bool = False,
-    generator: str = "llama-3.1-8b-base",
+    generator: str | None = None,
+    prompt_mode: str = "base",
 ) -> dict[str, Any]:
     """Generate the JSON array expected by AlpacaEval; judging is a separate step."""
     if batch_size < 1 or max_new_tokens < 1 or (limit is not None and limit < 1):
         raise ValueError("batch_size, max_new_tokens and limit must be positive")
+    if generator is None:
+        generator = str(model_name_or_path) if prompt_mode == "sft" else "llama-3.1-8b-base"
     examples = load_alpaca(data_path)
     if limit is not None:
         examples = examples[:limit]
-    prompts = build_alpaca_prompts(examples)
+    prompts = build_alpaca_prompts(examples, prompt_mode)
     if dry_run:
         print(f"Loaded {len(examples)} examples. First full prompt:\n{prompts[0]}")
-        return {"num_examples": len(examples), "dry_run": True}
+        return {"num_examples": len(examples), "dry_run": True, "prompt_mode": prompt_mode}
 
     model, tokenizer, model_device = load_generation_model(model_name_or_path, device, seed)
     run_dir = Path(output_dir) / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     run_dir.mkdir(parents=True, exist_ok=False)
     config = {
-        "model": model_name_or_path, "generator": generator, "data_path": str(Path(data_path).resolve()),
+        "model": str(model_name_or_path), "prompt_mode": prompt_mode, "generator": generator, "data_path": str(Path(data_path).resolve()),
         "num_examples": len(examples), "batch_size": batch_size,
         "max_new_tokens": max_new_tokens, "device": device, "seed": seed,
         "decoding": "greedy", "temperature": 0.0, "top_p": 1.0, "stop": "# Query:",
@@ -96,20 +99,21 @@ def evaluate(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Zero-shot AlpacaEval generation for supplement section 3.3")
+    parser = argparse.ArgumentParser(description="Zero-shot AlpacaEval generation for supplement sections 3.3 and 5.3")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--data-path", type=Path, default=REPO_ROOT / "data/alpaca_eval/alpaca_eval_gpt4_turbo.json")
-    parser.add_argument("--output-dir", type=Path, default=REPO_ROOT / "results/alpaca_baseline")
-    parser.add_argument("--generator", default="llama-3.1-8b-base")
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--generator")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--prompt-mode", choices=("base", "sft"), default="base")
     args = parser.parse_args()
     evaluate(
         model_name_or_path=args.model, data_path=args.data_path, output_dir=args.output_dir,
         batch_size=args.batch_size, max_new_tokens=args.max_new_tokens, device=args.device,
-        limit=args.limit, seed=args.seed, dry_run=args.dry_run, generator=args.generator,
+        limit=args.limit, seed=args.seed, dry_run=args.dry_run, prompt_mode=args.prompt_mode, generator=args.generator,
     )

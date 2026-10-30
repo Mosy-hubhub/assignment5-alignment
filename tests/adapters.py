@@ -7,7 +7,8 @@ import torch
 from torch import Tensor
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
-from cs336_alignment.sft_training import PackedSFTDataset, iterate_batches
+from cs336_alignment.sft_training import PackedSFTDataset
+from cs336_alignment.dpo import compute_per_instance_dpo_loss
 from cs336_alignment.mmlu_eval import parse_mmlu_response
 from cs336_alignment.gsm8k_eval import parse_gsm8k_response
 from cs336_alignment.grpo import compute_group_normalized_rewards, compute_rollout_rewards, get_response_log_probs, tokenize_prompt_and_output, aggregate_loss_across_microbatch, grpo_train_step, compute_policy_gradient_loss
@@ -488,4 +489,7 @@ def run_compute_per_instance_dpo_loss(
     Returns:
         torch.Tensor with the DPO loss for this example.
     """
-    raise NotImplementedError
+    return compute_per_instance_dpo_loss(
+        lm=lm, lm_ref=lm_ref, tokenizer=tokenizer, beta=beta,
+        prompt=prompt, response_chosen=response_chosen, response_rejected=response_rejected,
+    )

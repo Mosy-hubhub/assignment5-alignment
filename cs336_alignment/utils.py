@@ -8,6 +8,17 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL = "meta-llama/Meta-Llama-3.1-8B"
 
 
+def load_eval_template(prompt_mode: str = "base") -> str:
+    """Select the baseline or SFT outer prompt without adding a gold response."""
+    prompt_dir = REPO_ROOT / "cs336_alignment/prompts_safety"
+    if prompt_mode == "base":
+        return (prompt_dir / "zero_shot_system_prompt.prompt").read_text(encoding="utf-8")
+    if prompt_mode == "sft":
+        # Match training's template trimming, retaining the newline before the response.
+        return (prompt_dir / "alpaca_sft.prompt").read_text(encoding="utf-8").rstrip()
+    raise ValueError("prompt_mode must be 'base' or 'sft'")
+
+
 def load_generation_model(model_name_or_path: str, device: str, seed: int):
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
